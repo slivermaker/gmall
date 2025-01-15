@@ -268,13 +268,168 @@ producer_partition_by=table
 ![](imge/md-20250114152409.png)
 drawio文件请查看
 图解\ods-flink-dim.drawio
+**这是维度表怎么配置的三种方案**
 
 
 
+数据可以产生之后就考虑一点etl
+
+数据格式大约是
+![](imge/md-20250115101211.png)
+```Java
+    private SingleOutputStreamOperator<JSONObject> etl(DataStreamSource<String> stream) {
+        return stream
+            .filter(json -> {
+                try {
+                    
+                    JSONObject obj = JSON.parseObject(json.replaceAll("bootstrap-", ""));
+                    
+                    return "gmall2022".equals(obj.getString("database"))
+                        && (
+                        "insert".equals(obj.getString("type"))
+                            || "update".equals(obj.getString("type")))
+                        && obj.getString("data") != null
+                        && obj.getString("data").length() > 2;
+                    
+                    
+                } catch (Exception e) {
+                    System.out.println("json 格式有误, 你的数据是: " + json);
+                    return false;
+                }
+            })
+            .map(JSON::parseObject);  // 转成jsonObject,方便后序使用
+        
+    }
+```
+对于
+bootstrap-insert\start\complete
+可以看图解![](imge/md-20250115101423.png)
+对于维度数据在程序启动之前就可能有，我们只能检查变化数据，对于用bootstrap全量导入的数据在etl做检查
+
+![](imge/md-20250114231348.png)旧数据全量同步
 
 
 
+```sql
+/opt/software/mock » vim table_process.sql                                                   
+CREATE TABLE `table_process` (
+  `source_table` varchar(200) NOT NULL COMMENT '来源表',
+  `sink_table` varchar(200) DEFAULT NULL COMMENT '输出表',
+  `sink_columns` varchar(2000) DEFAULT NULL COMMENT '输出字段',
+  `sink_pk` varchar(200) DEFAULT NULL COMMENT '主键字段',
+  `sink_extend` varchar(200) DEFAULT NULL COMMENT '建表扩展',
+  PRIMARY KEY (`source_table`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
+/*Data for the table `table_process` */
+INSERT INTO `table_process`(`source_table`, `sink_table`, `sink_columns`, `sink_pk`, `sink_extend`) VALUES ('activity_info', 'dim_activity_info', 'id,activity_name,activity_type,activity_desc,start_time,end_time,create_time', 'id', NULL);
+.........
+```
+这就是配置表
+source_table 表示MySQL的表
+sink_table表示Phoenix的表
+sink_colums表示来源表所需要的列
+sink_pk做主键hbase的rowkey
+
+[flink-cdc](https://developer.aliyun.com/article/777502)
+![](imge/md-20250115113101.png)
+
+
+暂时使用flink-cdc做配置数据同步
+业务数据也可以用flink-cdc代替MySQL-maxwell
+[mysqlcdc](https://github.com/apache/flink-cdc/blob/master/docs/content.zh/docs/connectors/flink-sources/mysql-cdc.md)
+1.flink-cdc2.x版本可以在mysqlcdc同时监控多张异构的表
+| 特性                  | Flink CDC                          | MySQL + Maxwell                  |
+|-----------------------|------------------------------------|----------------------------------|
+| **支持数据库**         | MySQL、PostgreSQL、MongoDB 等      | 仅 MySQL                         |
+| **全量 + 增量同步**    | 支持                               | 仅支持增量同步                   |
+| **动态表发现**         | 支持                               | 不支持                           |
+| **与实时计算集成**     | 直接集成 Flink，一体化实时计算      | 需要额外集成（如 Flink、Spark）   |
+| **部署复杂度**         | 较高（需部署 Flink 集群）          | 较低（独立服务）                 |
+| **适用场景**           | 实时数仓、数据湖、实时计算          | 数据管道、数据同步、日志分析      |
+
+
+
+记得修改my.cnf确保数据库可以监控配置库的表变化
+
+flink
+最后读取的大概长这样
+```json
+{
+    "before": {
+        "id": 1,
+        "name": "Alice",
+        "age": 25,
+        "email": "alice@example.com"
+    },
+    "after": {
+        "id": 1,
+        "name": "Alice",
+        "age": 26,  // age 字段从 25 更新为 26
+        "email": "alice@example.com"
+    },
+    "source": {
+        "version": "1.9.7.Final",
+        "connector": "mysql",
+        "name": "mysql_binlog_source",
+        "ts_ms": 1672502400000,
+        "snapshot": "false",
+        "db": "test_db",
+        "table": "users",
+        "server_id": 1,
+        "file": "mysql-bin.000001",
+        "pos": 12345,
+        "row": 0,
+        "thread": 1,
+        "query": null
+    },
+    "op": "u",  // u 表示 UPDATE
+    "ts_ms": 1672502400000
+}
+```
+只需要读取after之后的 
+再说一下动态建表相关
+配置的数据会被广播放到  processBroadcastElement 会被重复建表（当然加判断逻辑也能避免），
+[广播流建表](#3)
+
+
+建表的时候我们发现有很多表带有
+
+SALT_BUCKETS = 4（给出三个分界分出四个块然后rowkey去比较去到哪个块，这个是自动生成的，主键前面有随机值不会出现聚集在一个地方的情况）
+ 盐表
+
+ ------------
+ regionserver
+ region
+  数据
+
+默认情况 建表一张表只有一个region
+
+当region膨胀一定程度, 会自动分裂
+
+    旧: 10G 一分为2
+
+    新: ...
+
+    hadoop162
+     r1  r2
+
+   自动迁移
+    r2 迁移到163
+
+
+jdbc在phoenix连接时八小时没有使用就会掐断
+// 避免与服务器的长连接, 长时间没有使用, 服务器会自动关闭连接.
+```java
+if (conn.isClosed()) {
+    conn = JdbcUtil.getPhoenixConnection();
+}
+```
+也可以使用连接池使用druid
+
+至此ods->dim结束可以打包到集群实验 避免资源不够用
+bin/yarn-session.sh -d 在flink下后台yarn执行
+bin/flink run -d -c  类名 jar地址和spark类似
 
 
 
@@ -948,5 +1103,123 @@ Maxwell 输出的数据是 JSON 格式,包含以下字段:
 
 3. **Flink CDC**:
    - 基于 Apache Flink 的 CDC 工具,支持实时数据同步和流式计算。
+
+
+## 以下是Flink
+
+<p id="3"></p> 
+
+## 广播流建表避免重复
+
+---
+
+## **问题发生的原因**
+
+### 1. **广播流的特性**
+- **广播流**是 Flink 中一种特殊的数据流，它的数据会被复制并发送到所有下游任务的并行实例中。
+- 广播流通常用于分发**全局配置**或**小数据集**，确保所有任务都能访问相同的数据。
+
+### 2. **`processBroadcastElement` 的执行机制**
+- `processBroadcastElement` 是 `BroadcastProcessFunction` 中用于处理广播流数据的方法。
+- 每当广播流中有新的数据到达时，`processBroadcastElement` 都会被调用。
+- 如果广播流中的数据频繁更新，或者作业的并行度较高，`processBroadcastElement` 可能会被频繁调用。
+
+### 3. **重复建表的原因**
+- 在 `processBroadcastElement` 中直接调用 `tableEnv.executeSql` 来执行建表语句，会导致以下问题：
+  - **多次触发**：每次广播流数据到达时，都会尝试建表。
+  - **并行任务独立执行**：每个并行任务都会独立调用 `processBroadcastElement`，导致重复建表。
+  - **缺乏状态管理**：如果没有记录表是否已经创建，每次调用时都会尝试建表。
+
+---
+
+## **解决办法**
+
+### 1. **在 `processBroadcastElement` 中添加状态管理**
+- 使用 `BroadcastState` 来记录表是否已经创建。
+- 只有在状态为 `null` 时，才执行建表语句。
+
+**优点**：
+- 避免重复建表。
+- 逻辑清晰，易于实现。
+
+**缺点**：
+- 需要额外管理状态。
+- 如果配置流中的数据频繁更新，可能会导致状态管理复杂。
+
+**适用场景**：
+- 配置流中的数据较少，且更新频率较低。
+
+---
+
+### 2. **在变成广播流之前建表**
+- 在配置流变成广播流之前，先读取配置流中的数据，并执行建表语句。
+- 建表完成后，再将配置流广播到所有并行任务。
+
+**优点**：
+- 建表逻辑只执行一次，避免重复建表。
+- 逻辑分离，代码更清晰。
+- 性能优化，减少在 `processBroadcastElement` 中的额外操作。
+
+**缺点**：
+- 如果配置流中的数据频繁更新，可能需要额外的逻辑来处理表更新。
+
+**适用场景**：
+- 配置流中的数据较少，且更新频率较低。
+- 需要在作业启动时一次性加载配置。
+
+---
+
+### 3. **使用外部存储记录建表状态**
+- 在作业外部（例如数据库或分布式缓存）记录表是否已经创建。
+- 在 `processBroadcastElement` 中，先检查外部状态，再决定是否建表。
+
+**优点**：
+- 避免重复建表。
+- 状态管理更灵活，适合分布式环境。
+
+**缺点**：
+- 需要依赖外部存储，增加了系统复杂性。
+- 可能会引入额外的性能开销。
+
+**适用场景**：
+- 配置流中的数据频繁更新。
+- 需要在多个作业之间共享状态。
+
+---
+
+## **扩展知识点**
+
+### 1. **Flink 的状态管理**
+- **Keyed State**：与 Key 绑定的状态，适用于 KeyedStream。
+- **Operator State**：与算子绑定的状态，适用于非 KeyedStream。
+- **Broadcast State**：用于广播流的状态，所有任务共享同一份状态。
+
+### 2. **动态表管理**
+- Flink 支持动态创建、更新和删除表。
+- 动态表管理通常用于以下场景：
+  - 配置驱动的 ETL 流程。
+  - 动态 schema 变更。
+  - 多租户环境下的表隔离。
+
+### 3. **广播流的应用场景**
+- **配置分发**：将配置信息广播到所有任务。
+- **规则引擎**：将规则数据广播到所有任务，用于实时计算。
+- **维表关联**：将小数据集广播到所有任务，用于流表关联。
+
+---
+
+## **最佳实践**
+
+### 1. **配置流的设计**
+- 尽量将配置流设计为静态数据，避免频繁更新。
+- 如果配置流需要动态更新，可以通过版本控制或时间戳来管理。
+
+### 2. **表的管理**
+- 在作业启动时一次性加载配置并建表。
+- 如果需要动态更新表结构，可以先删除旧表，再创建新表。
+
+### 3. **状态管理**
+- 尽量使用 Flink 的内置状态管理机制（如 `BroadcastState`）。
+- 如果需要跨作业共享状态，可以使用外部存储（如 Redis、HBase）。
 
 
