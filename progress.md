@@ -433,13 +433,123 @@ bin/flink run -d -c  类名 jar地址和spark类似
 
 
 
+再说一下非结构化流的方式构建事实表（日志）
+- **数据清洗（ETL）**：在数据传输过程中可能会出现数据丢失，需要对脏数据进行过滤。
+- **新老访客状态标记修复**：日志数据中的 `is_new` 字段用于标记新老访客状态（0 表示老访客），需要修复该标记以确保数据可靠性。
+- 日志数据将被拆分为五张事务事实表并写入 Kafka，包括：
+  - 流量域识别浏览事务事实表
+  - 流量域启动事务事实表
+  - 流量域动作事务事实表
+  - 流量域曝光事务事实表
+
+5个流:
+启动日志: 主流
+页面 曝光 活动 错误  测输出流
+
+曝光![](imge/md-20250116090744.png)
+
+
+```json
+{
+  "actions": [
+    {
+      "action_id": "get_coupon",
+      "item": "1",
+      "item_type": "coupon_id",
+      "ts": 1660533645854
+    }
+  ],
+  "common": {
+    "ar": "110000",
+    "ba": "Xiaomi",
+    "ch": "vivo",
+    "is_new": "1",
+    "md": "Xiaomi 9",
+    "mid": "mid_162470",
+    "os": "Android 11.0",
+    "uid": "34",
+    "vc": "v2.1.134"
+  },
+  "displays": [
+    {
+      "display_type": "promotion",
+      "item": "20",
+      "item_type": "sku_id",
+      "order": 1,
+      "pos_id": 3
+    },
+    {
+      "display_type": "promotion",
+      "item": "8",
+      "item_type": "sku_id",
+      "order": 2,
+      "pos_id": 2
+    },
+    {
+      "display_type": "promotion",
+      "item": "12",
+      "item_type": "sku_id",
+      "order": 2,
+      "pos_id": 2
+    }
+  ]
+}
+```
+ods_log
+1. 维度表数据
+     java -jar gmall2020-mock-db-2021...
+       只会产生 user_info
+
+     别的维度表bootstrap...
+
+2. yarn集群跑flink
+        per-job  过时
+        application 用这个
+        session
+            先起动集群
+            在提交job
+
+3. ....
+
+-------
+
+修复的逻辑:
+     定义一个状态: 存储年月日, 用户第一次访问的年月日
+
+  is_new = 1
+     state和今天是同一天或者状态中没有值
+       不用修复
+
+
+     state和今天不是同一天
+        is_new = 0
+  is_new = 0
+      一定是老用户, 不用修复
+      更新状态: 更新成昨天
 
 
 
 
+计算DAU
+
+dwd去重
+
+写出每个用户的当天的第一条明细数据
+
+数据源:
+    启动日志
+        可以, 但是, 数据量可能偏小
+
+        只有app有
+
+    页面
+        只要找到第一个页面记录
 
 
+如何找到第一个访问记录?
+    使用状态
 
+    如果考虑乱序, 应该找到第一个窗口, 窗口内的时间戳最小的那个
 
 
 
