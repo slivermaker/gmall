@@ -1,3 +1,4 @@
+```json
 {
     "database": "gmall2022",
     "table": "spu_info",
@@ -338,3 +339,4 @@
     "ts": 1736849644,
     "data": {}
 }
+```

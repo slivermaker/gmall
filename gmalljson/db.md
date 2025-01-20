@@ -1,3 +1,4 @@
+```json
 {
     "database": "gmall2022",
     "table": "order_info",
@@ -1505,3 +1506,4 @@
         "order_status": "1005"
     }
 }
+```
