@@ -154,7 +154,7 @@ tips 该环境下z命令变成j命令 工作原理是通过记录目录的访问
 
 
 
-## 数据采集 
+## 数据采集 （ods 外加导入dim）
 关键词: **Flume kafka zookeeper MySQL Maxwell**
 
 
@@ -509,63 +509,208 @@ ods_log
             先起动集群
             在提交job
 
-3. ....
 
--------
+## DWD
+### 新用户相关：
+  修复的逻辑:
+      定义一个状态: 存储年月日, 用户第一次访问的年月日
 
-修复的逻辑:
-     定义一个状态: 存储年月日, 用户第一次访问的年月日
-
-  is_new = 1
-     state和今天是同一天或者状态中没有值
-       不用修复
-
-
-     state和今天不是同一天
-        is_new = 0
-  is_new = 0
-      一定是老用户, 不用修复
-      更新状态: 更新成昨天
+    is_new = 1
+      state和今天是同一天或者状态中没有值
+        不用修复
 
 
+      state和今天不是同一天
+          is_new = 0
+    is_new = 0
+        一定是老用户, 不用修复
+        更新状态: 更新成昨天
+![](imge/md-20250120100609.png)
+
+### 计算DAU日活
+
+  dwd去重
+
+  写出每个用户的当天的第一条明细数据
+
+  数据源:
+      启动日志
+          可以, 但是, 数据量可能偏小
+
+          只有app有
+
+      页面
+          只要找到第一个页面记录
 
 
-计算DAU
+  如何找到第一个访问记录?
+      使用状态
 
-dwd去重
+      如果考虑乱序, 应该找到第一个窗口, 窗口内的时间戳最小的那个
+![](imge/md-20250120100827.png)
 
-写出每个用户的当天的第一条明细数据
+### 用户跳出
+跳出是指会话中只有一个页面的访问行为。如果能获取会话的所有页面，只要筛选页面数为 1 的会话即可获取跳出明细数据。
 
-数据源:
-    启动日志
-        可以, 但是, 数据量可能偏小
+在离线数仓中，我们可以获取一整天的数据，结合访问时间、`page_id` 和 `last_page_id` 字段对整体数据集做处理，按照会话对页面日志进行划分，从而获得每个会话的页面数，只要筛选页面数为 1 的会话即可提取跳出明细数据。
 
-        只有app有
+在实时计算中，无法考虑整体数据集，很难按照会话对页面访问记录进行划分。而本项目模拟生成的日志数据中没有 `session_id`（会话 ID）字段，也无法通过按照 `session_id` 分组的方式计算每个会话的页面数。
 
-    页面
-        只要找到第一个页面记录
+因此，我们需要换一种解决思路。如果能判定首页日志之后没有同一会话的页面访问记录，同样可以筛选跳出数据。如果日志数据完全有序，会话页面不存在交叉情况，则跳出页面的判定可以分为三种情况：
+
+1. 两条紧邻的首页日志进入算子，可以判定第一条首页日志所属会话为跳出会话；
+2. 第一条首页日志进入算子后，接收到的第二条日志为非首页日志，则第一条日志所属会话不是跳出会话；
+3. 第一条首页日志进入算子后，没有收到第二条日志，此时无法得出结论，必须继续等待。但是无休止地等待显然是不现实的。因此，人为设定超时时间，超时时间内没有第二条数据就判定为跳出行为，这是一种近似处理，存在误差，但若能结合业务场景设置合理的超时时间，误差是可以接受的。本程序为了便于测试，设置超时时间为 10s，为了更快看到效果可以设置更小的超时时间，生产环境的设置结合业务需求确定。
+
+由上述分析可知，情况 1 的首页数据和情况 3 中的超时数据为跳出明细数据。
+
+Flink CEP（Complex Event Processing 复杂事件处理）是在 Flink 上层实现的复杂事件处理库，可以在无界流中检测出特定的事件模型。用户定义复杂规则（Pattern），将其应用到流上，即可从流中提取满足 Pattern 的一个或多个简单事件构成的复杂事件。
+
+Flink CEP 定义的规则之间的连续策略：
+
+- 严格连续：期望所有匹配的事件严格的一个接一个出现，中间没有任何不匹配的事件。对应方法为 `next()`；
+- 松散连续：忽略匹配的事件之间的不匹配的事件。对应方法为 `followedBy()`；
+- 不确定的松散连续：更进一步的松散连续，允许忽略掉一些匹配事件的附加匹配。对应方法为 `followedByAny()`。
+
+实现步骤如下：
+
+1. 按照 `mid` 分组：不同访客的浏览记录互不干涉，跳出行为的分析应在相同 `mid` 下进行，首先按照 `mid` 分组。
+2. 定义 CEP 匹配规则：
+   - 规则一：跳出行为对应的页面日志必然为某一会话的首页，因此第一个规则判定 `last_page_id` 是否为 `null`，是则返回 `true`，否则返回 `false`；
+   - 规则二：规则二和规则一之间的策略采用严格连续，要求二者之间不能有其它事件。判断 `last_page_id` 是否为 `null`，在数据完整有序的前提下，如果不是 `null` 说明本条日志的页面不是首页，可以断定它与规则一匹配到的事件同属于一个会话，返回 `false`；如果是 `null` 则开启了一个新的会话，此时可以判定上一条页面日志所属会话为跳出会话，是我们需要的数据，返回 `true`；
+   - 超时时间：超时时间内规则一被满足，未等到第二条数据则会被判定为超时数据。
+3. 把匹配规则（Pattern）应用到流上：根据 Pattern 定义的规则对流中数据进行筛选。
+4. 提取超时流：提取超时流，超时流中满足规则一的数据即为跳出明细数据，取出。
+5. 合并主流和超时流，写入 Kafka 调出明细主题。
+6. 结果分析：理论上 Flink 可以通过设置水位线保证数据严格有序（超时时间足够大），在此前提下，同一 `mid` 的会话之间不会出现交叉。若假设日志数据没有丢失，按照上述匹配规则，我们可以获得两类明细数据：
+   - 两个规则都被满足，满足规则一的数据为跳出明细数据。在会话之间不会交叉且日志数据没有丢失的前提下，此时获取的跳出明细数据没有误差；
+   - 第一条数据满足规则二，超时时间内没有接收到第二条数据，水位线达到超时时间，第一条数据被发送到超时侧输出流。即便在会话之间不交叉且日志数据不丢失的前提下，此时获取的跳出明细数据仍有误差，因为超时时间之后会话可能并未结束，如果此时访客在同一会话内跳转到了其它页面，就会导致会话页面数大于 1 的访问被判定为跳出行为，下游计算的跳出率偏大。误差大小和设置的超时时间呈负相关关系，超时时间越大，理论上误差越小。
 
 
-如何找到第一个访问记录?
-    使用状态
+![](imge/md-20250120105141.png)
 
-    如果考虑乱序, 应该找到第一个窗口, 窗口内的时间戳最小的那个
+### 用户加购
+
+在使用flinksql的时候由于是流式计算肯定会先出现主键带着null的情况，直接消费时可以重写FlinkKafkaConsumer 方法过滤null，消费flinksql连接时出现的null它会自动处理
+
+更多详细操作细节查看note-table&&sql
+加购操作
+![](imge/md-20250120212051.png)
+![](imge/md-20250120221101.png)
+
+```java
+public class Dwd_04_DwdTradeCartAdd extends BaseSqlApp {
+    public static void main(String[] args) {
+        new Dwd_04_DwdTradeCartAdd().init(3004, 2, "Dwd_04_DwdTradeCartAdd");
+    }
+    
+    @Override
+    protected void handle(StreamExecutionEnvironment env,
+                          StreamTableEnvironment tEnv) {
+        // 1. 读取ods_db数据
+        readOdsDb(tEnv, "Dwd_04_DwdTradeCartAdd");
+        
+        // 2. 过滤cart_info数据
+        Table cartInfo = tEnv.sqlQuery("select " +
+                                           "data['id'] id, " +
+                                           "data['user_id'] user_id, " +
+                                           "data['sku_id'] sku_id, " +
+                                           "data['source_id'] source_id, " +
+                                           "data['source_type'] source_type, " +
+                                           "if(`type` = 'insert', " +
+                                           "data['sku_num'],cast((cast(data['sku_num'] as int) - cast(`old`['sku_num'] as int)) as string)) sku_num, " +
+                                           "ts, " +
+                                           "pt " +
+                                           "from ods_db " +
+                                           "where `database`='gmall2022' " +
+                                           "and `table`='cart_info' " +
+                                           "and (" +
+                                           " `type`='insert' " +
+                                           "  or (`type`='update'" +
+                                           "      and `old`['sku_num'] is not null " + // 由于sku_num变化导致的update
+                                           "      and cast(`data`['sku_num'] as int) > cast(`old`['sku_num'] as int)" +
+                                           "     )" +
+                                           ")");
+        tEnv.createTemporaryView("cart_info", cartInfo);
+        
+        // 3. 读取字典表
+        readBaseDic(tEnv);
+        // 4. 维度退化
+        Table result = tEnv.sqlQuery("select " +
+                                         "ci.id, " +
+                                         "ci.user_id, " +
+                                         "ci.sku_id, " +
+                                         "ci.source_id, " +
+                                         "ci.source_type, " +
+                                         "dic.dic_name source_type_name, " +
+                                         "ci.sku_num, " +
+                                         "ci.ts " +
+                                         "from cart_info ci " +
+                                         "join base_dic for system_time as of ci.pt as dic " +
+                                         "on ci.source_type=dic.dic_code");
+        
+        // 5. 定义一个动态表与kafka的topic关联
+        tEnv.executeSql("create table dwd_trade_cart_add( " +
+                          "id string, " +
+                          "user_id string, " +
+                          "sku_id string, " +
+                          "source_id string, " +
+                          "source_type_code string, " +
+                          "source_type_name string, " +
+                          "sku_num string, " +
+                          "ts bigint " +
+                          ")" + SQLUtil.getKafkaSink(Constant.TOPIC_DWD_TRADE_CART_ADD)
+        );
+    
+        result.executeInsert("dwd_trade_cart_add");
+        
+        
+    }
+}
+```
+主要理解一下第二代码段
+![](imge/md-20250121102912.png)
+### 订单预处理表
+经过分析，订单明细表和取消订单明细表的数据来源、表结构都相同，差别只在业务过程和过滤条件，为了减少重复计算，将两张表公共的关联过程提取出来，形成订单预处理表。
+关联订单明细表、订单表、订单明细活动关联表、订单明细优惠券关联表四张事实业务表和字典表（维度业务表）形成订单预处理表，写入 Kafka 对应主题。
+本节形成的预处理表中要保留订单表的 type 和 old 字段，用于过滤订单明细数据和取消订单明细数据。
 
 
+#### 数据表关联与TTL设置
 
+- **order_detail**
+  - **join**
+    - **TTL设置建议**:
+      - 下单时会生成一条`order_info`和n条`order_detail`，几乎同时产生。建议TTL设置为`10s`。
+      - 订单取消时，`order_info`会有一条数据更新，而`order_detail`不会发生任何变化。取消操作可能在30分钟后发生，此时仍需要关联之前的详情，建议TTL设置为`1h`。
 
+#### 数据表关联关系
 
+- **order_info**
+  - **left join**
+    - **activity**
+      - **left join**
+        - **coupon**
+          - **lookup join**
+            - **dic**
 
+#### Kafka写入策略
 
+- 使用`upsert-kafka`进行写入。
 
+#### 数据去重策略
 
+- 由于存在`left join`，将来消费时可能会有重复数据，需要进行去重。
+- 保留数据最全的记录，即数据生成时间最大的记录。
 
+示例数据
 
+| 订单ID | 金额  | 优惠券 | 生成时间       |
+|--------|-------|--------|----------------|
+| 1      | 100.1 | null   | 生成时间       |
+| 1      | 100.1 | 10     | 生成时间       |
 
-
-
-
-
+![](imge/md-20250121122032.png)
 
 
 
