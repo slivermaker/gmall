@@ -847,9 +847,32 @@ public class Dwd_06_DwdTradeOrderDetail extends BaseSqlApp {
 
 
 
+## DWS
+
+  - 进行轻度汇总，处理小窗口级别的数据汇总。  
+  - 处理海量资源，例如“666jz”。  
+
+- **数据存储**  
+  - 存储介质应支持SQL查询，常用技术包括：  
+    - MySQL：适合结构化数据存储。  
+    - Hive：适合大数据处理。  
+    - HBase + Phoenix：适合实时查询。  
+    - ClickHouse：适合实时分析。  
+    - Doris：适合大规模数据分析。  
+
+- **实时查询**  
+  - 需要支持大流量数据的实时查询，推荐使用ClickHouse和Doris。  
+
+- **ADS（Application Data Store）层**  
+  - 根据具体时间范围对数据进行进一步汇总。  
+  - 使用SQL语句进行数据汇总和查询，例如：  
+    ```sql
+    SELECT ..., SUM(...) FROM t WHERE time >= ... AND time <= ...
+    ```
 
 
-
+doris
+![](imge/md-20250123143135.png)
 
 
 
